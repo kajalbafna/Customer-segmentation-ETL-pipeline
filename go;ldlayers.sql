@@ -1,0 +1,795 @@
+-- Databricks notebook source
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC from pyspark.ml.feature import VectorAssembler, StandardScaler
+-- MAGIC from pyspark.ml.clustering import KMeans
+-- MAGIC from sklearn.cluster import DBSCAN
+-- MAGIC from sklearn.preprocessing import StandardScaler as SklearnScaler
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # GLOBAL SUPERSTORE
+-- MAGIC # BRONZE → SILVER → GOLD → K-MEANS → DBSCAN
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 1. PATHS
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC bronze_path = "/Volumes/bromze/default/kaajal/bronze_global_superstore"
+-- MAGIC silver_path = "/Volumes/bromze/default/kaajal/silver_global_superstore"
+-- MAGIC gold_base = "/Volumes/bromze/default/kaajal/"
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 2. READ BRONZE
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC bronze_df = spark.read.format("delta").load(bronze_path)
+-- MAGIC
+-- MAGIC print("Bronze layer loaded successfully")
+-- MAGIC
+-- MAGIC bronze_df.printSchema()
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 3. CREATE SILVER
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC silver_df = bronze_df.dropDuplicates()
+-- MAGIC
+-- MAGIC
+-- MAGIC # Trim string columns
+-- MAGIC for col_name, data_type in silver_df.dtypes:
+-- MAGIC
+-- MAGIC     if data_type == "string":
+-- MAGIC
+-- MAGIC         silver_df = silver_df.withColumn(
+-- MAGIC             col_name,
+-- MAGIC             F.trim(F.col(col_name))
+-- MAGIC         )
+-- MAGIC
+-- MAGIC
+-- MAGIC # Convert dates
+-- MAGIC if "Order_Date" in silver_df.columns:
+-- MAGIC
+-- MAGIC     silver_df = silver_df.withColumn(
+-- MAGIC         "Order_Date",
+-- MAGIC         F.to_date(F.col("Order_Date"))
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC if "Ship_Date" in silver_df.columns:
+-- MAGIC
+-- MAGIC     silver_df = silver_df.withColumn(
+-- MAGIC         "Ship_Date",
+-- MAGIC         F.to_date(F.col("Ship_Date"))
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC # Remove records with missing IDs
+-- MAGIC required_columns = [
+-- MAGIC     c for c in
+-- MAGIC     ["Order_ID", "Customer_ID", "Product_ID"]
+-- MAGIC     if c in silver_df.columns
+-- MAGIC ]
+-- MAGIC
+-- MAGIC if required_columns:
+-- MAGIC
+-- MAGIC     silver_df = silver_df.dropna(
+-- MAGIC         subset=required_columns
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 4. SAVE SILVER
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC silver_df.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(silver_path)
+-- MAGIC
+-- MAGIC print("Silver layer created successfully")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 5. CREATE SQL VIEW
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC silver_df.createOrReplaceTempView(
+-- MAGIC     "silver_global_superstore"
+-- MAGIC )
+-- MAGIC
+-- MAGIC print("Silver SQL view created")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 6. GOLD - SALES SUMMARY
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_sales_summary = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders,
+-- MAGIC     COUNT(DISTINCT Customer_ID) AS total_customers,
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity,
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC     ROUND(
+-- MAGIC         AVG(TRY_CAST(Sales AS DOUBLE)),
+-- MAGIC         2
+-- MAGIC     ) AS average_order_value
+-- MAGIC FROM silver_global_superstore
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_sales_summary.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(gold_base + "gold_sales_summary")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 7. GOLD - CATEGORY
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_category = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     Category,
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity,
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders
+-- MAGIC FROM silver_global_superstore
+-- MAGIC GROUP BY Category
+-- MAGIC ORDER BY total_sales DESC
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_category.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(gold_base + "gold_category")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 8. GOLD - SUB CATEGORY
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_subcategory = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     Category,
+-- MAGIC     `Sub-Category`,
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity,
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders
+-- MAGIC FROM silver_global_superstore
+-- MAGIC GROUP BY
+-- MAGIC     Category,
+-- MAGIC     `Sub-Category`
+-- MAGIC ORDER BY total_sales DESC
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_subcategory.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(gold_base + "gold_subcategory")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 9. GOLD - CUSTOMER
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_customer = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     Customer_ID,
+-- MAGIC     Customer_Name,
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders,
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity,
+-- MAGIC     ROUND(
+-- MAGIC         AVG(TRY_CAST(Sales AS DOUBLE)),
+-- MAGIC         2
+-- MAGIC     ) AS average_order_value
+-- MAGIC FROM silver_global_superstore
+-- MAGIC GROUP BY
+-- MAGIC     Customer_ID,
+-- MAGIC     Customer_Name
+-- MAGIC ORDER BY total_sales DESC
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_customer.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(gold_base + "gold_customer")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 10. GOLD - REGION
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_region = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     Region,
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity,
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders
+-- MAGIC FROM silver_global_superstore
+-- MAGIC GROUP BY Region
+-- MAGIC ORDER BY total_sales DESC
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_region.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(gold_base + "gold_region")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 11. GOLD - COUNTRY
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_country = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     Country,
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity,
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders
+-- MAGIC FROM silver_global_superstore
+-- MAGIC GROUP BY Country
+-- MAGIC ORDER BY total_sales DESC
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_country.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(gold_base + "gold_country")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 12. GOLD - MONTHLY SALES
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_monthly_sales = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     YEAR(Order_Date) AS order_year,
+-- MAGIC     MONTH(Order_Date) AS order_month,
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity,
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders
+-- MAGIC FROM silver_global_superstore
+-- MAGIC WHERE Order_Date IS NOT NULL
+-- MAGIC GROUP BY
+-- MAGIC     YEAR(Order_Date),
+-- MAGIC     MONTH(Order_Date)
+-- MAGIC ORDER BY
+-- MAGIC     order_year,
+-- MAGIC     order_month
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_monthly_sales.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(gold_base + "gold_monthly_sales")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 13. GOLD - PRODUCT
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_product = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     Product_ID,
+-- MAGIC     Product_Name,
+-- MAGIC     Category,
+-- MAGIC     `Sub-Category`,
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity,
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders
+-- MAGIC FROM silver_global_superstore
+-- MAGIC GROUP BY
+-- MAGIC     Product_ID,
+-- MAGIC     Product_Name,
+-- MAGIC     Category,
+-- MAGIC     `Sub-Category`
+-- MAGIC ORDER BY total_sales DESC
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_product.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(gold_base + "gold_product")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 14. CUSTOMER DATA FOR ML
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC customer_ml = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC     Customer_ID,
+-- MAGIC     Customer_Name,
+-- MAGIC
+-- MAGIC     COUNT(DISTINCT Order_ID) AS total_orders,
+-- MAGIC
+-- MAGIC     SUM(TRY_CAST(Sales AS DOUBLE)) AS total_sales,
+-- MAGIC
+-- MAGIC     SUM(TRY_CAST(Profit AS DOUBLE)) AS total_profit,
+-- MAGIC
+-- MAGIC     SUM(TRY_CAST(Quantity AS DOUBLE)) AS total_quantity
+-- MAGIC
+-- MAGIC FROM silver_global_superstore
+-- MAGIC
+-- MAGIC GROUP BY
+-- MAGIC     Customer_ID,
+-- MAGIC     Customer_Name
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC # Remove NULL values
+-- MAGIC customer_ml = customer_ml.fillna(
+-- MAGIC     0,
+-- MAGIC     subset=[
+-- MAGIC         "total_orders",
+-- MAGIC         "total_sales",
+-- MAGIC         "total_profit",
+-- MAGIC         "total_quantity"
+-- MAGIC     ]
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 15. K-MEANS
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC print("Running K-Means...")
+-- MAGIC
+-- MAGIC
+-- MAGIC ml_features = [
+-- MAGIC     "total_orders",
+-- MAGIC     "total_sales",
+-- MAGIC     "total_profit",
+-- MAGIC     "total_quantity"
+-- MAGIC ]
+-- MAGIC
+-- MAGIC
+-- MAGIC assembler = VectorAssembler(
+-- MAGIC     inputCols=ml_features,
+-- MAGIC     outputCol="raw_features"
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC assembled_df = assembler.transform(
+-- MAGIC     customer_ml
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC # Standardize
+-- MAGIC scaler = StandardScaler(
+-- MAGIC     inputCol="raw_features",
+-- MAGIC     outputCol="features",
+-- MAGIC     withMean=True,
+-- MAGIC     withStd=True
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC scaler_model = scaler.fit(
+-- MAGIC     assembled_df
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC scaled_df = scaler_model.transform(
+-- MAGIC     assembled_df
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC # K-Means with 3 clusters
+-- MAGIC kmeans = KMeans(
+-- MAGIC     k=3,
+-- MAGIC     seed=42,
+-- MAGIC     featuresCol="features",
+-- MAGIC     predictionCol="kmeans_cluster"
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC kmeans_model = kmeans.fit(
+-- MAGIC     scaled_df
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC kmeans_result = kmeans_model.transform(
+-- MAGIC     scaled_df
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 16. SAVE K-MEANS
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_kmeans = kmeans_result.select(
+-- MAGIC     "Customer_ID",
+-- MAGIC     "Customer_Name",
+-- MAGIC     "total_orders",
+-- MAGIC     "total_sales",
+-- MAGIC     "total_profit",
+-- MAGIC     "total_quantity",
+-- MAGIC     "kmeans_cluster"
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC gold_kmeans.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(
+-- MAGIC         gold_base + "gold_customer_kmeans"
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC print("K-Means completed")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 17. DBSCAN
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC print("Running DBSCAN...")
+-- MAGIC
+-- MAGIC
+-- MAGIC # Convert only required columns to Pandas
+-- MAGIC dbscan_pd = gold_kmeans.toPandas()
+-- MAGIC
+-- MAGIC
+-- MAGIC dbscan_features = dbscan_pd[
+-- MAGIC     [
+-- MAGIC         "total_orders",
+-- MAGIC         "total_sales",
+-- MAGIC         "total_profit",
+-- MAGIC         "total_quantity"
+-- MAGIC     ]
+-- MAGIC ].fillna(0)
+-- MAGIC
+-- MAGIC
+-- MAGIC # Standardize
+-- MAGIC sk_scaler = SklearnScaler()
+-- MAGIC
+-- MAGIC
+-- MAGIC X_scaled = sk_scaler.fit_transform(
+-- MAGIC     dbscan_features
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC # DBSCAN
+-- MAGIC dbscan_model = DBSCAN(
+-- MAGIC     eps=0.8,
+-- MAGIC     min_samples=5
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC dbscan_labels = dbscan_model.fit_predict(
+-- MAGIC     X_scaled
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC dbscan_pd["dbscan_cluster"] = dbscan_labels
+-- MAGIC
+-- MAGIC
+-- MAGIC # -1 = outlier
+-- MAGIC dbscan_pd["is_outlier"] = (
+-- MAGIC     dbscan_pd["dbscan_cluster"] == -1
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 18. CONVERT DBSCAN RESULT BACK TO SPARK
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_dbscan = spark.createDataFrame(
+-- MAGIC     dbscan_pd
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 19. SAVE DBSCAN
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC gold_dbscan.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(
+-- MAGIC         gold_base + "gold_customer_dbscan"
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC print("DBSCAN completed")
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 20. FINAL CUSTOMER SEGMENTATION TABLE
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC final_customer_segmentation = gold_dbscan.select(
+-- MAGIC     "Customer_ID",
+-- MAGIC     "Customer_Name",
+-- MAGIC     "total_orders",
+-- MAGIC     "total_sales",
+-- MAGIC     "total_profit",
+-- MAGIC     "total_quantity",
+-- MAGIC     "kmeans_cluster",
+-- MAGIC     "dbscan_cluster",
+-- MAGIC     "is_outlier"
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC final_customer_segmentation.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(
+-- MAGIC         gold_base + "gold_customer_segmentation"
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 21. SQL VIEW
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC final_customer_segmentation.createOrReplaceTempView(
+-- MAGIC     "gold_customer_segmentation"
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 22. K-MEANS SUMMARY
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC kmeans_summary = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC
+-- MAGIC     kmeans_cluster,
+-- MAGIC
+-- MAGIC     COUNT(*) AS customer_count,
+-- MAGIC
+-- MAGIC     ROUND(AVG(total_sales), 2)
+-- MAGIC         AS avg_sales,
+-- MAGIC
+-- MAGIC     ROUND(AVG(total_profit), 2)
+-- MAGIC         AS avg_profit,
+-- MAGIC
+-- MAGIC     ROUND(AVG(total_orders), 2)
+-- MAGIC         AS avg_orders,
+-- MAGIC
+-- MAGIC     ROUND(AVG(total_quantity), 2)
+-- MAGIC         AS avg_quantity
+-- MAGIC
+-- MAGIC FROM gold_customer_segmentation
+-- MAGIC
+-- MAGIC GROUP BY kmeans_cluster
+-- MAGIC
+-- MAGIC ORDER BY kmeans_cluster
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC kmeans_summary.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(
+-- MAGIC         gold_base + "gold_kmeans_summary"
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 23. DBSCAN SUMMARY
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC dbscan_summary = spark.sql("""
+-- MAGIC SELECT
+-- MAGIC
+-- MAGIC     dbscan_cluster,
+-- MAGIC
+-- MAGIC     COUNT(*) AS customer_count,
+-- MAGIC
+-- MAGIC     ROUND(AVG(total_sales), 2)
+-- MAGIC         AS avg_sales,
+-- MAGIC
+-- MAGIC     ROUND(AVG(total_profit), 2)
+-- MAGIC         AS avg_profit,
+-- MAGIC
+-- MAGIC     ROUND(AVG(total_orders), 2)
+-- MAGIC         AS avg_orders,
+-- MAGIC
+-- MAGIC     SUM(
+-- MAGIC         CASE
+-- MAGIC             WHEN is_outlier = true
+-- MAGIC             THEN 1
+-- MAGIC             ELSE 0
+-- MAGIC         END
+-- MAGIC     ) AS outlier_count
+-- MAGIC
+-- MAGIC FROM gold_customer_segmentation
+-- MAGIC
+-- MAGIC GROUP BY dbscan_cluster
+-- MAGIC
+-- MAGIC ORDER BY dbscan_cluster
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC dbscan_summary.write \
+-- MAGIC     .format("delta") \
+-- MAGIC     .mode("overwrite") \
+-- MAGIC     .option("overwriteSchema", "true") \
+-- MAGIC     .save(
+-- MAGIC         gold_base + "gold_dbscan_summary"
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 24. CREATE SQL VIEWS FOR WAREHOUSE / POWER BI
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_sales_summary
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_sales_summary`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_category
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_category`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_subcategory
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_subcategory`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_customer
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_customer`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_region
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_region`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_country
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_country`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_monthly_sales
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_monthly_sales`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_product
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_product`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_customer_segmentation
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_customer_segmentation`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_kmeans_summary
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_kmeans_summary`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC spark.sql("""
+-- MAGIC CREATE OR REPLACE TEMP VIEW vw_gold_dbscan_summary
+-- MAGIC AS
+-- MAGIC SELECT *
+-- MAGIC FROM delta.`/Volumes/bromze/default/kaajal/gold_dbscan_summary`
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC # ============================================================
+-- MAGIC # 25. DISPLAY FINAL RESULTS
+-- MAGIC # ============================================================
+-- MAGIC
+-- MAGIC print("")
+-- MAGIC print("======================================================")
+-- MAGIC print("PIPELINE COMPLETED SUCCESSFULLY")
+-- MAGIC print("======================================================")
+-- MAGIC
+-- MAGIC
+-- MAGIC print("")
+-- MAGIC print("K-MEANS SUMMARY")
+-- MAGIC kmeans_summary.show(truncate=False)
+-- MAGIC
+-- MAGIC
+-- MAGIC print("")
+-- MAGIC print("DBSCAN SUMMARY")
+-- MAGIC dbscan_summary.show(truncate=False)
+-- MAGIC
+-- MAGIC
+-- MAGIC print("")
+-- MAGIC print("CUSTOMER SEGMENTATION")
+-- MAGIC final_customer_segmentation.show(
+-- MAGIC     20,
+-- MAGIC     truncate=False
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC print("")
+-- MAGIC print("======================================================")
+-- MAGIC print("GOLD TABLES")
+-- MAGIC print("======================================================")
+-- MAGIC
+-- MAGIC print("""
+-- MAGIC 1. gold_sales_summary
+-- MAGIC 2. gold_category
+-- MAGIC 3. gold_subcategory
+-- MAGIC 4. gold_customer
+-- MAGIC 5. gold_region
+-- MAGIC 6. gold_country
+-- MAGIC 7. gold_monthly_sales
+-- MAGIC 8. gold_product
+-- MAGIC 9. gold_customer_kmeans
+-- MAGIC 10. gold_customer_dbscan
+-- MAGIC 11. gold_customer_segmentation
+-- MAGIC 12. gold_kmeans_summary
+-- MAGIC 13. gold_dbscan_summary
+-- MAGIC """)
+-- MAGIC
+-- MAGIC
+-- MAGIC print("======================================================")
+-- MAGIC print("READY FOR DATABRICKS SQL / POWER BI")
+-- MAGIC print("======================================================")
